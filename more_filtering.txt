@@ -1,0 +1,235 @@
+"""
+Hybrid RAG & Vector Indexing Master Reference Script
+Author: AI Collaborator
+Target Framework: LangChain & PostgreSQL (via langchain-postgres)
+
+Prerequisites:
+    pip install langchain-postgres langchain-openai rank-bm25 psycopg langchain-core
+
+Description:
+    This script serves as a complete engineering reference covering the transition
+    from naive in-memory prototyping to production-grade, database-driven hybrid search.
+    It contains implementations for:
+      1. Naive Hybrid Search (In-Memory Prototype) with strict top-k guardrails.
+      2. Production Remote Database Setup using PostgreSQL (pgvector).
+      3. Index building recipes (HNSW graph vs IVFFlat Clustering vs Keyword GIN).
+      4. Native remote database Hybrid execution with custom weightings and limits.
+"""
+
+import os
+from typing import List
+from langchain_core.documents import Document
+from langchain_core.embeddings import FakeEmbeddings # Used as a generic placeholder
+from langchain_openai import OpenAIEmbeddings
+
+# =====================================================================
+# TECHNIQUE 1: NAIVE IN-MEMORY HYBRID SEARCH (PROTOTYPE ONLY)
+# =====================================================================
+# Role: Good for scripts or small tasks. It uses client memory to run search math.
+# Problem: Rebuilds index every boot up, doesn't scale horizontally, high RAM load.
+def run_naive_in_memory_hybrid(docs: List[Document], query: str, top_k: int = 5):
+    from langchain.retrievers import BM25Retriever, EnsembleRetriever
+    from langchain_community.vectorstores import FAISS
+
+    print("\n--- Running Naive In-Memory Prototype Hybrid Search ---")
+    
+    # Initialize basic embeddings
+    embeddings = FakeEmbeddings(size=384) # Match dimension to your real model (e.g. MiniLM-L6)
+
+    # Path A: Dense Semantic Vector Layer (Flat/Linear index by default in simple libraries)
+    dense_vectorstore = FAISS.from_documents(docs, embeddings)
+    dense_retriever = dense_vectorstore.as_retriever(search_kwargs={"k": top_k})
+
+    # Path B: Sparse Lexical Keyword Layer (Built completely from scratch every run!)
+    sparse_retriever = BM25Retriever.from_documents(docs)
+    sparse_retriever.k = top_k
+
+    # Layer C: Combine and Rank via Reciprocal Rank Fusion (RRF)
+    # EnsembleRetriever returns a UNION, meaning it will output anywhere between K and 2K documents.
+    hybrid_retriever = EnsembleRetriever(
+        retrievers=[dense_retriever, sparse_retriever],
+        weights=[0.7, 0.3] # 70% Weight to meaning, 30% Weight to exact wording
+    )
+
+    # CRITICAL PRODUCTION GUARDRAIL: LangChain Expression Language (LCEL) Slicing
+    # This pipeline forces the ensemble retriever to strictly chop off the unwanted "extra" trailing chunks.
+    final_pipeline = hybrid_retriever | (lambda retrieved_docs: retrieved_docs[:top_k])
+    
+    results = final_pipeline.invoke(query)
+    print(f"Strictly returned {len(results)} chunks.")
+    return results
+
+
+# =====================================================================
+# PRODUCTION STACK: CORE CONFIGURATION & DB INDEX MANAGEMENT
+# =====================================================================
+# Connection details for your remote production architecture
+CONNECTION_STRING = "postgresql+psycopg://postgres:your_password@://remote-db-host.com"
+TABLE_NAME = "production_knowledge_base"
+VECTOR_DIMENSION = 1536 # Dimensionality of text-embedding-3-small
+
+def run_once_database_ingestion(docs: List[Document]):
+    """
+    Ingests documents ONCE to the remote server. 
+    Never repeat index creation at runtime.
+    """
+    from langchain_postgres import PGEngine, PGVectorStore
+
+    print("\n--- Starting Production Remote Database Ingestion ---")
+    
+    # Connect to the remote server engine
+    engine = PGEngine.from_connection_string(url=CONNECTION_STRING)
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+    # Native Initialization: Sets up structural tables inside Postgres
+    vector_store = PGVectorStore.create_sync(
+        engine=engine,
+        table_name=TABLE_NAME,
+        embedding_service=embeddings
+    )
+
+    # Persist documents permanently to the database server disk
+    vector_store.add_documents(docs)
+    print("Ingestion Complete: Documents safely saved on the remote server.")
+
+
+# =====================================================================
+# THE INDEX CHOICES (EXPLAINED AND CODED)
+# =====================================================================
+def build_database_indexes():
+    """
+    Applies search accelerating configurations inside PostgreSQL.
+    """
+    from langchain_postgres import PGEngine, PGVectorStore
+
+    engine = PGEngine.from_connection_string(url=CONNECTION_STRING)
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    
+    vector_store = PGVectorStore(
+        engine=engine,
+        table_name=TABLE_NAME,
+        embedding_service=embeddings
+    )
+
+    # -----------------------------------------------------------------
+    # CHOICE A: HNSW Index (Hierarchical Navigable Small World Graph)
+    # -----------------------------------------------------------------
+    # Role: Multilayer geometric graph structure. Functions like highway skips.
+    # Benefits: Maximum retrieval speed, highest query accuracy, supports dynamic additions.
+    # When to use: Standard production standard. Default choice for RAG setups.
+    # Footprint: HIGH RAM Overhead (keeps network map loaded in server memory).
+    #
+    # Code to build HNSW:
+    print("Building HNSW graph and Keyword GIN index on the remote database...")
+    vector_store.create_index(index_type="hnsw", distance_strategy="cosine")
+    
+    # -----------------------------------------------------------------
+    # CHOICE B: IVFFlat Index (Inverted File with Flat Compression)
+    # -----------------------------------------------------------------
+    # Role: Groups data into distinct geometric cluster cells via K-Means calculation.
+    # Benefits: Extremely low RAM footprint, fast index build times.
+    # When to use: When scaling to millions of rows on constrained/budget cloud tiers.
+    # Footprint: LOW memory. Accuracy can degrade over time if data changes drastically without retraining.
+    # NOTE: CANNOT be run on an empty table. Must contain documents to calculate cluster centers.
+    #
+    # Code to build IVFFlat (Commented out - select either HNSW or this):
+    # vector_store.create_index(
+    #     index_type="ivfflat", 
+    #     distance_strategy="cosine", 
+    #     lists=100 # Rule of Thumb: Total Row count divided by 1000
+    # )
+
+    # -----------------------------------------------------------------
+    # UNIQUE HYBRID LAYER: GIN Index (Generalized Inverted Index)
+    # -----------------------------------------------------------------
+    # Role: The textbook back-of-the-book index tracker. 
+    # Benefits: Replaces standard slow text column parsing. Maps every single word to its exact row ID.
+    # When to use: Crucial for production keyword matching (e.g., error codes, product model tracking).
+    # Note: Modern `langchain-postgres` create_index architectures automatically construct the GIN index
+    # on accompanying tsvector columns during index_type compilation!
+
+
+# =====================================================================
+# TECHNIQUE 2: PRODUCTION REMOTE NATIVE HYBRID SEARCH
+# =====================================================================
+# Role: Server-side execution. Python doesn't do index processing or document memory loops.
+# Both HNSW (Semantic) and GIN (Keyword) search execute inside Postgres under a single query statement.
+def execute_production_hybrid_search(query: str, top_k: int = 5):
+    from langchain_postgres import PGEngine, PGVectorStore
+
+    print("\n--- Executing Native Production Hybrid Database Search ---")
+    
+    engine = PGEngine.from_connection_string(url=CONNECTION_STRING)
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+    # Pull existing remote index target schema mapping
+    vector_store = PGVectorStore(
+        engine=engine,
+        table_name=TABLE_NAME,
+        embedding_service=embeddings
+    )
+
+    # Instantiate search parameter mapping directly into Postgres
+    hybrid_retriever = vector_store.as_retriever(
+        search_type="hybrid",
+        search_kwargs={
+            "k": top_k,
+            "weights": [0.7, 0.3],    # Custom Weighting: [Dense Vector weight, Sparse Keyword weight]
+            "proves": 10              # Optional: Adjust accuracy setting if using IVFFlat clustering
+        }
+    )
+
+    # Tight LCEL restriction pipeline to guarantee prompt context cleanliness
+    final_retriever = hybrid_retriever | (lambda retrieved_docs: retrieved_docs[:top_k])
+
+    # Run the query instantly with zero local computational startup delay
+    top_docs = final_retriever.invoke(query)
+    
+    print(f"Retrieved target documents from remote host database successfully.")
+    for index, doc in enumerate(top_docs, 1):
+        print(f"[{index}] Metadata: {doc.metadata} | Snippet: {doc.page_content[:60]}...")
+        
+    return top_docs
+
+
+# =====================================================================
+# TESTING DEMONSTRATION WORKFLOW
+# =====================================================================
+if __name__ == "__main__":
+    # Mock Document Dataset Creation
+    sample_documents = [
+        Document(page_content="Error code 503 deployed. Fix it by altering the cloud infrastructure memory limits.", metadata={"file": "devops_log.txt"}),
+        Document(page_content="Database cluster scaling guidelines dictate regular schema cleanup strategies.", metadata={"file": "dba_manual.md"}),
+        Document(page_content="Authentication protocols require an encrypted OAuth2 validation callback handshake.", metadata={"file": "security.txt"})
+    ]
+    
+    test_query = "How do I fix error 503 limits?"
+    
+    # 1. Run local mock prototype proof of concept
+
+
+
+
+from langchain_postgres import PGEngine, PGVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+CONNECTION_STRING = "postgresql+psycopg://postgres:your_password@://remote-db-host.com"
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+# Connect to the remote database engine
+engine = PGEngine.from_connection_string(url=CONNECTION_STRING)
+
+# Reference your existing table
+vector_store = PGVectorStore(
+    engine=engine,
+    table_name="production_knowledge_base",
+    embedding_service=embeddings
+)
+
+# Build the HNSW Graph Index natively on the Postgres server
+# This builds the vector index and configures the GIN text layout under the hood.
+vector_store.create_index(
+    index_type="hnsw", 
+    distance_strategy="cosine"
+)
+print("HNSW Vector Graph Index successfully initialized on the server!")
